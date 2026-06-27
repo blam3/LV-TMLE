@@ -1,0 +1,6 @@
+"n_size","meas_error","outcome","latent","indicators","Estimator","Bias","Abs_Bias","RMSE","Coverage","N_reps"
+50,"small","linear","normal","continuous","LV",-0.376891970543319,0.376891970543319,0.376891970543319,1,1
+50,"small","linear","normal","continuous","LV_noY",-0.385710202617404,0.385710202617404,0.385710202617404,1,1
+50,"small","linear","normal","continuous","Oracle",-0.333298979613662,0.333298979613662,0.333298979613662,1,1
+50,"small","linear","normal","continuous","RegCal",-0.374965787133358,0.374965787133358,0.374965787133358,1,1
+50,"small","linear","normal","continuous","SEM",-0.205967999962769,0.205967999962769,0.205967999962769,1,1

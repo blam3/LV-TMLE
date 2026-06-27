@@ -1,0 +1,91 @@
+> cat("\n================ SMOKE TEST SUMMARY ================\n")
+
+================ SMOKE TEST SUMMARY ================
+> cat(sprintf("Cell: outcome=%s latent=%s indic=%s  N=%d error=%s  | true psi=%.3f | REPS=%d \n\n",
++             SCEN_OUTCOME, SCEN_LATENT, SCEN_INDICATORS, SCEN_N, SCEN_ERROR, PSI, REPS))
+Cell: outcome=nonlinear latent=normal indic=continuous  N=250 error=medium  | true psi=2.700 | REPS=40 
+
+> print(format(tab, digits = 3), row.names = FALSE)
+ Estimator  n Mean     Bias
+     Naive 40 2.33 -0.37425
+       SEM 40 2.02 -0.68254
+    Robust 40 2.12 -0.58469
+    Oracle 40 2.69 -0.00762
+    RegCal 40 2.61 -0.08960
+ MCSE_bias Emp_SD Mean_SE
+    0.0359  0.227   0.190
+    0.0378  0.239   0.169
+    0.0291  0.184   0.270
+    0.0286  0.181   0.188
+    0.0339  0.215   0.221
+ SE_ratio Coverage
+    0.837    0.475
+    0.709    0.075
+    1.466    0.375
+    1.039    0.900
+    1.028    0.925
+> 
+> mB <- mean(lvB, na.rm = TRUE); mW <- mean(lvW, na.rm = TRUE)
+> share <- mB / (mB + mW)
+> cat(sprintf("\nLV-TMLE variance decomposition:  within (W_bar)=%.4g  between (B)=%.4g  latent share=%.1f%%\n",
++             mW, mB, 100 * share))
+
+LV-TMLE variance decomposition:  within (W_bar)=0.05369  between (B)=0.02104  latent share=28.2%
+> 
+> # ---- Pass / fail (infrastructure) + diagnostics -----------------------------
+> get <- function(j, col) tab[tab$Estimator == j, col]
+> checks <- list()
+> add <- function(name, pass, msg) checks[[length(checks) + 1]] <<-
++   list(name = name, pass = pass, msg = msg)
+> 
+> # Infrastructure (HARD)
+> ok_pipe <- mean(is.finite(est[, "Oracle"]) & is.finite(est[, "Robust"]) &
++                 is.finite(est[, "SEM"]) & is.finite(est[, "Naive"]))
+> add("Pipeline completes", ok_pipe >= 0.8,
++     sprintf("%.0f%% of reps produced all four estimates", 100 * ok_pipe))
+> 
+> oracle_tol <- max(0.10, 2.5 * get("Oracle", "MCSE_bias"))
+> add("Oracle recovers psi (engine OK)", abs(get("Oracle", "Bias")) < oracle_tol,
++     sprintf("Oracle bias = %+.3f (tol %.3f)", get("Oracle", "Bias"), oracle_tol))
+> 
+> add("B > 0 and propagates (Rubin SE OK)", is.finite(mB) && mB > 0 && share > 0.01,
++     sprintf("B = %.4g, latent share = %.1f%%", mB, 100 * share))
+> 
+> add("SEM is curvature-biased (DGP wired right)", get("SEM", "Bias") < -0.30,
++     sprintf("SEM bias = %+.3f (expected ~ -0.70: coef ~2.0 vs psi ~2.7)", get("SEM", "Bias")))
+> 
+> # Method-level (DIAGNOSTIC, reported not enforced)
+> rob_att   <- get("Robust", "Bias") < -0.15
+> regcal_ok <- abs(get("RegCal", "Bias")) < abs(get("Naive", "Bias"))
+> 
+> cat("\n--- Infrastructure checks ---\n")
+
+--- Infrastructure checks ---
+> for (c in checks)
++   cat(sprintf("  [%s] %-40s %s\n", if (c$pass) "PASS" else "FAIL", c$name, c$msg))
+  [PASS] Pipeline completes                       100% of reps produced all four estimates
+  [PASS] Oracle recovers psi (engine OK)          Oracle bias = -0.008 (tol 0.100)
+  [PASS] B > 0 and propagates (Rubin SE OK)       B = 0.02104, latent share = 28.2%
+  [PASS] SEM is curvature-biased (DGP wired right) SEM bias = -0.683 (expected ~ -0.70: coef ~2.0 vs psi ~2.7)
+> 
+> cat("\n--- Method diagnostics (not pass/fail) ---\n")
+
+--- Method diagnostics (not pass/fail) ---
+> cat(sprintf("  Robust(MI no-Y) bias = %+.3f  -> %s\n", get("Robust", "Bias"),
++             if (rob_att) "ATTENUATED, as predicted: impute conditions on indicators only, not Y."
++             else "not strongly attenuated (better than expected -- inspect)."))
+  Robust(MI no-Y) bias = -0.585  -> ATTENUATED, as predicted: impute conditions on indicators only, not Y.
+> cat(sprintf("  RegCal(EAP)     bias = %+.3f  -> %s than Naive(Bartlett) bias %+.3f\n",
++             get("RegCal", "Bias"),
++             if (regcal_ok) "CLOSER to psi" else "NOT closer", get("Naive", "Bias")))
+  RegCal(EAP)     bias = -0.090  -> CLOSER to psi than Naive(Bartlett) bias -0.374
+> 
+> infra_pass <- all(vapply(checks, function(c) c$pass, logical(1)))
+> cat(sprintf("\n==> INFRASTRUCTURE: %s\n", if (infra_pass) "OK -- engine, Rubin SE, and DGP are sound."
++                                           else "PROBLEM -- fix before scaling up."))
+
+==> INFRASTRUCTURE: OK -- engine, Rubin SE, and DGP are sound.
+> cat("==> METHOD: the point-estimate fix (regression scores + outcome-aware draws)\n",
++     "    still needs to be settled before the full array. See notes.\n")
+==> METHOD: the point-estimate fix (regression scores + outcome-aware draws)
+     still needs to be settled before the full array. See notes.

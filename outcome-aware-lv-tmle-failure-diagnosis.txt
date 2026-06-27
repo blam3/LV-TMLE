@@ -1,0 +1,102 @@
+---
+Why the outcome-aware LV-TMLE doesn't recover the true ψ
+
+There is one concrete code bug and two statistical design flaws. The design flaws are the dominant cause of attenuation.
+
+---
+Statistical flaw 1 (primary): var_y is massively inflated
+
+The posterior precision added by conditioning on Y is:
+
+b_y_l² / var_y
+
+var_y is lav_var(pe, "Y") — lavaan's residual variance from fitting the linear SEM model Y ~ L + W + Z + Z_sq on a nonlinear DGP. Because the true outcome is 1 + 2L + 0.7L² + 0.5LW + ..., the L² and LW terms cannot be captured by the linear model and leak into var_y. A rough calculation shows var_y_SEM ≈ 4–6 while the true noise variance is Y_SD² = 1.
+
+This deflates the Y-information term by a factor of 4–6×. Concretely:
+
+┌───────────────────────────────┬───────────────────┬─────────────────────────┐
+│           Quantity            │ SEM-misspecified  │         Correct         │
+├───────────────────────────────┼───────────────────┼─────────────────────────┤
+│ b_y_l                         │ ~2.0 (linear      │ ~2.0 at mean L          │
+│                               │ coef)             │ (coincidence)           │
+├───────────────────────────────┼───────────────────┼─────────────────────────┤
+│ var_y                         │ ~5 (inflated)     │ ~1 (true noise)         │
+├───────────────────────────────┼───────────────────┼─────────────────────────┤
+│ b_y_l²/var_y (precision gain  │ ~0.8              │ ~4.0                    │
+│ from Y)                       │                   │                         │
+├───────────────────────────────┼───────────────────┼─────────────────────────┤
+│ Indicator precision sum(λ²/θ) │ ~8.4              │ ~8.4                    │
+└───────────────────────────────┴───────────────────┴─────────────────────────┘
+
+So Y contributes only 0.8 / (8.4 + 0.8) ≈ 9% of the posterior precision, when it should contribute 4 / (8.4 + 4) ≈ 32%. The outcome-aware posterior is barely different from the indicator-only posterior. The whole outcome-conditioning step is nearly inert.
+
+Fix A (most impactful): Replace the SEM's residual var_y with the residual from a flexible model — fit a MARS/GAM/SL for Y on the EAP factor scores, W, Z, Z_sq; use that residual variance. It will be close to 1 (the true noise), giving the Y-update its rightful weight.
+
+# After computing mu_noY (EAP scores), fit a flexible model:
+flex_fit <- try(earth(Y ~ ., data = data.frame(Y = dt$Y, L_hat = mu_noY,
+                                               W = dt$W, Z = dt$Z, Z_sq = dt$Z_sq)),
+                silent = TRUE)
+if (!inherits(flex_fit, "try-error")) {
+  var_y_eff <- mean((dt$Y - predict(flex_fit))^2)  # ≈ Y_SD² = 1
+} else {
+  var_y_eff <- var_y  # fallback
+}
+
+Then substitute var_y_eff for var_y in the precision and RHS calculations at lines 94 and 97.
+
+---
+Statistical flaw 2 (secondary): Congeniality gap
+
+Even with a correct var_y, a linear imputation model can't fully exploit Y's nonlinear information about L. For the DGP Y = 1 + 2L + 0.7L² + 0.5LW + ...:
+
+- The linear coefficient b_y_l ≈ 2.0 is the correct linear approximation at E[L] = 0, but misses the fact that the marginal effect of L on Y is 2 + 1.4L + 0.5W — so for subjects with high L, Y is extra informative about L via the L² channel, and the linear model ignores this.
+- The true posterior P(L | I, Y, W, Z) is non-Gaussian (because the likelihood P(Y|L) is nonlinear), but the code computes a Gaussian approximation assuming linearity. High-Y observations should pull the posterior mean much higher than the linear approximation does.
+
+The net effect: the imputed L values still have less dynamic range than L_true, and the TMLE Q-model sees an attenuated predictor. This is the "congeniality residual bias" predicted in §9(a) of the handoff.
+
+Fix B (more principled, moderate complexity): Use the TMLE's own Q-model to construct the Y-link. After an initial TMLE pass (e.g., with RegCal), the Q-model is a flexible nonparametric fit to E[Y | L_hat, W, Z]. Use its partial derivative with respect to L as the effective slope, and its residual as var_y_eff:
+
+# After initial RegCal TMLE gives qfit (the cross-fitted Q-model):
+# Compute numerical derivative dQ/dL at the factor scores
+eps_num <- 1e-3
+dQdL <- (predict(qfit, data.frame(L_sim = mu_noY + eps_num, W, Z)) -
+          predict(qfit, data.frame(L_sim = mu_noY - eps_num, W, Z))) / (2 * eps_num)
+b_y_l_eff <- mean(dQdL)                 # ≈ 2.7 instead of 2.0
+var_y_eff  <- mean((dt$Y - predict(qfit, ...))^2)   # ≈ 1
+
+This makes the imputation congruent with the analysis (the same model that feeds into the TMLE also informs the posterior), directly addressing the congeniality gap.
+
+---
+Code bug: missing Y intercept in y_xpart (line 69)
+
+y_xpart  <- b_y_w * dt$W + b_y_z * dt$Z + b_y_z2 * dt$Z_sq
+
+The SEM's Y-intercept b_y_0 is omitted. Under the nonlinear DGP, E[Y] = 1 + 0.7 * Var(L) ≈ 2.11, so the SEM estimates b_y_0 ≈ 2.11. The missing intercept shifts every subject's mu_full upward by the same constant (post_var * b_y_l * b_y_0 / var_y ≈ 0.09).
+
+This does NOT bias ψ. Because the shift is a constant across all subjects, the TMLE's Q-model learns the relationship between (shifted A) and Y, and the shift cancels when computing Q(A+δ) - Q(A). But it's still wrong and should be fixed:
+
+# In sem_posterior_full(), after extracting other coefficients:
+b_y_0   <- get_pe(pe, "Y", "~1", "", field = "est", default = 0)
+y_xpart <- b_y_0 + b_y_w * dt$W + b_y_z * dt$Z + b_y_z2 * dt$Z_sq
+
+In lavaan, intercepts appear with op = "~1" and rhs = "" in parameterEstimates, so get_pe will find it correctly.
+
+---
+Summary
+
+Issue: var_y inflation from SEM misspecification
+Cause: L², LW variance leaks into SEM residual; Y-precision term ~10% of true value
+Effect on ψ: Strong attenuation (dominant)
+Priority: Fix first
+────────────────────────────────────────
+Issue: Congeniality gap
+Cause: Linear imputation model misses nonlinear L↔Y channel
+Effect on ψ: Residual attenuation after Fix A
+Priority: Fix with Q-model linearization
+────────────────────────────────────────
+Issue: Missing Y intercept (b_y_0)
+Cause: y_xpart omits SEM intercept
+Effect on ψ: Constant shift; psi unbiased
+Priority: Fix for correctness
+
+Fix A (flexible var_y) is the change most likely to visibly move the LV estimate toward ψ ≈ 2.7. Fix B is the principled longer-term solution. Fix C (the intercept) is a correctness patch.
