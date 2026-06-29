@@ -32,7 +32,6 @@ suppressPackageStartupMessages({
   library(SuperLearner)
   library(earth)
   library(rpart)
-  library(gam)
   library(dplyr)
 })
 
@@ -67,6 +66,76 @@ rownames(sim_grid) <- NULL
 # ------------------------------------------------------------------------------
 # 1. SAFE SUPERLEARNER + SAFE PREDICTION  (unchanged in spirit; robust wrappers)
 # ------------------------------------------------------------------------------
+.lv_diag_env <- new.env(parent = emptyenv())
+
+lv_diag_reset <- function() {
+  .lv_diag_env$calls <- 0L
+  .lv_diag_env$fallback_short_n <- 0L
+  .lv_diag_env$fallback_low_variance <- 0L
+  .lv_diag_env$superlearner_error <- 0L
+  .lv_diag_env$glm_fallback <- 0L
+  .lv_diag_env$mean_fallback <- 0L
+  .lv_diag_env$discrete_sl <- 0L
+  .lv_diag_env$predict_fallback <- 0L
+  invisible(NULL)
+}
+
+lv_diag_bump <- function(name) {
+  if (is.null(.lv_diag_env$calls)) lv_diag_reset()
+  .lv_diag_env[[name]] <- as.integer(.lv_diag_env[[name]]) + 1L
+  invisible(NULL)
+}
+
+lv_diag_snapshot <- function() {
+  if (is.null(.lv_diag_env$calls)) lv_diag_reset()
+  list(
+    sl_calls = .lv_diag_env$calls,
+    sl_fallback_short_n = .lv_diag_env$fallback_short_n,
+    sl_fallback_low_variance = .lv_diag_env$fallback_low_variance,
+    sl_superlearner_error = .lv_diag_env$superlearner_error,
+    sl_glm_fallback = .lv_diag_env$glm_fallback,
+    sl_mean_fallback = .lv_diag_env$mean_fallback,
+    sl_discrete = .lv_diag_env$discrete_sl,
+    sl_predict_fallback = .lv_diag_env$predict_fallback
+  )
+}
+
+lv_diag_reset()
+
+with_lavaan_core_fallback <- function(expr) {
+  ns <- asNamespace("parallel")
+  old_detect <- get("detectCores", envir = ns)
+  detected <- try(c(old_detect(), old_detect(logical = FALSE)), silent = TRUE)
+  needs_patch <- inherits(detected, "try-error") ||
+    length(detected) == 0L || any(!is.finite(detected))
+
+  if (needs_patch) {
+    # lavaan 0.6-21 validates ncpus against parallel::detectCores(); in this
+    # managed shell detectCores() can return NA, so force serial SEM fitting.
+    was_locked <- bindingIsLocked("detectCores", ns)
+    if (was_locked) unlockBinding("detectCores", ns)
+    assign("detectCores", function(...) 1L, envir = ns)
+    if (was_locked) lockBinding("detectCores", ns)
+    on.exit({
+      if (was_locked) unlockBinding("detectCores", ns)
+      assign("detectCores", old_detect, envir = ns)
+      if (was_locked) lockBinding("detectCores", ns)
+    }, add = TRUE)
+  }
+
+  force(expr)
+}
+
+lv_sl_library <- function(n) {
+  # SL.gam was dropped after pilot runs repeatedly removed it with singularity
+  # errors. Keep the active library stable until a replacement is justified.
+  if (n <= 100) {
+    c("SL.glm", "SL.mean", "SL.rpart", "SL.earth")
+  } else {
+    c("SL.glm", "SL.earth", "SL.mean", "SL.rpart")
+  }
+}
+
 robust_predict <- function(model, newdata, covars) {
   if (is.list(model) && !is.null(model$fallback_mean))
     return(rep(model$fallback_mean, nrow(newdata)))
@@ -82,6 +151,7 @@ robust_predict <- function(model, newdata, covars) {
   }, error = function(e) NULL)
 
   if (is.null(out) || any(is.na(out)) || length(out) != nrow(newdata)) {
+    lv_diag_bump("predict_fallback")
     fallback <- if (!is.null(model$Y)) mean(model$Y, na.rm = TRUE) else 0
     return(rep(fallback, nrow(newdata)))
   }
@@ -89,18 +159,30 @@ robust_predict <- function(model, newdata, covars) {
 }
 
 safe_SL <- function(Y, X, family, SL.library) {
+  lv_diag_bump("calls")
   clean <- complete.cases(X, Y)
   Yc <- Y[clean]; Xc <- X[clean, , drop = FALSE]
 
-  if (nrow(Xc) < 10)        return(list(fallback_mean = mean(Yc, na.rm = TRUE), Y = Yc))
-  if (var(Yc) < 1e-8)       return(list(fallback_mean = mean(Yc, na.rm = TRUE), Y = Yc))
+  if (nrow(Xc) < 10) {
+    lv_diag_bump("fallback_short_n")
+    return(list(fallback_mean = mean(Yc, na.rm = TRUE), Y = Yc))
+  }
+  if (var(Yc) < 1e-8) {
+    lv_diag_bump("fallback_low_variance")
+    return(list(fallback_mean = mean(Yc, na.rm = TRUE), Y = Yc))
+  }
 
   fit <- try(SuperLearner(Y = Yc, X = Xc, family = family,
                           SL.library = SL.library, verbose = FALSE), silent = TRUE)
 
   if (inherits(fit, "try-error") || all(fit$SL.predict == 0)) {
+    lv_diag_bump("superlearner_error")
     fglm <- try(glm(Yc ~ ., data = Xc, family = family), silent = TRUE)
-    if (!inherits(fglm, "try-error")) return(fglm)
+    if (!inherits(fglm, "try-error")) {
+      lv_diag_bump("glm_fallback")
+      return(fglm)
+    }
+    lv_diag_bump("mean_fallback")
     return(list(fallback_mean = mean(Yc, na.rm = TRUE), Y = Yc))
   }
 
@@ -109,6 +191,7 @@ safe_SL <- function(Y, X, family, SL.library) {
   if (nrow(Xc) < 1000) {
     best <- which.min(fit$cvRisk)
     fit$coef <- rep(0, length(fit$coef)); fit$coef[best] <- 1
+    lv_diag_bump("discrete_sl")
   }
   fit
 }
@@ -220,10 +303,10 @@ fit_sem_posterior <- function(dt, indicators_type) {
     L ~ W + Z + Z_sq
     Y ~ L + W + Z + Z_sq
   '
-  fit <- try(suppressWarnings(
+  fit <- try(with_lavaan_core_fallback(suppressWarnings(
     sem(cfa_model, data = as.data.frame(dt), ordered = ordered_vars,
-        std.lv = FALSE, auto.fix.first = TRUE)
-  ), silent = TRUE)
+        std.lv = FALSE, auto.fix.first = TRUE, ncpus = 1L)
+  )), silent = TRUE)
 
   if (inherits(fit, "try-error") || !lavInspect(fit, "converged"))
     return(list(converged = FALSE, reason = "SEM_no_converge"))
@@ -316,10 +399,7 @@ run_comparison <- function(dt, indicators_type, M = 25, V = 5, delta = 1) {
     diagnostics = list(fail_location = "SEM", fail_reason = reason,
                        lv_B = NA, lv_Wbar = NA, lv_m = NA))
 
-  sl_lib <- if (nrow(dt) <= 100)
-    c("SL.glm", "SL.mean", "SL.rpart", "SL.earth")
-  else
-    c("SL.glm", "SL.earth", "SL.gam", "SL.mean", "SL.rpart")
+  sl_lib <- lv_sl_library(nrow(dt))
 
   # --- SEM fit + posterior (shared) ---
   post <- fit_sem_posterior(dt, indicators_type)

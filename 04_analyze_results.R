@@ -13,10 +13,18 @@ suppressPackageStartupMessages({
   library(tidyr)
 })
 
+args <- commandArgs(trailingOnly = TRUE)
+INPUT_DIR <- if (length(args) > 0) args[1] else "output"
+ANALYSIS_DIR <- if (length(args) > 1) args[2] else "."
+if (!dir.exists(ANALYSIS_DIR)) dir.create(ANALYSIS_DIR, recursive = TRUE)
+analysis_file <- function(...) file.path(ANALYSIS_DIR, ...)
+
 # 1. READ DATA -----------------------------------------------------------------
-files <- list.files("output", pattern = "\\.rds$", full.names = TRUE)
+files <- list.files(INPUT_DIR, pattern = "\\.rds$", full.names = TRUE)
 if (length(files) == 0) stop("No output files found.")
 df <- do.call(rbind, lapply(files, readRDS))
+cat("Reading", length(files), "result files from", INPUT_DIR, "\n")
+cat("Writing analysis artifacts to", ANALYSIS_DIR, "\n")
 
 # Re-attach grid factors (True_Psi already travels with each row).
 if (file.exists("01_setup.R")) source("01_setup.R")  # gives sim_grid w/ factors
@@ -29,8 +37,66 @@ fail_table <- df %>%
   count(n_size, meas_error, outcome, latent, indicators,
         Fail_Location, Fail_Reason, name = "Count") %>%
   arrange(desc(Count))
-write.csv(fail_table, "failure_diagnostics.csv", row.names = FALSE)
+write.csv(fail_table, analysis_file("failure_diagnostics.csv"), row.names = FALSE)
 cat("Crash/non-convergence rows:", sum(fail_table$Count), "\n")
+
+if (all(c("Warning_Count", "SL_Warning_Count", "SL_gam_Warning_Count",
+          "SL_Calls", "SL_SuperLearner_Error", "SL_GLM_Fallback",
+          "SL_Mean_Fallback", "SL_Predict_Fallback") %in% names(df))) {
+  first_nonempty <- function(x) {
+    x <- x[!is.na(x) & nzchar(x)]
+    if (length(x)) x[1] else NA_character_
+  }
+  learner_diag <- df %>%
+    group_by(n_size, meas_error, outcome, latent, indicators) %>%
+    summarise(
+      Reps = n(),
+      Reps_With_Warnings = sum(Warning_Count > 0, na.rm = TRUE),
+      Total_Warnings = sum(Warning_Count, na.rm = TRUE),
+      Total_SL_Warnings = sum(SL_Warning_Count, na.rm = TRUE),
+      Total_SL_gam_Warnings = sum(SL_gam_Warning_Count, na.rm = TRUE),
+      Mean_SL_Calls = mean(SL_Calls, na.rm = TRUE),
+      Total_SL_SuperLearner_Errors = sum(SL_SuperLearner_Error, na.rm = TRUE),
+      Total_SL_GLM_Fallbacks = sum(SL_GLM_Fallback, na.rm = TRUE),
+      Total_SL_Mean_Fallbacks = sum(SL_Mean_Fallback, na.rm = TRUE),
+      Total_SL_Predict_Fallbacks = sum(SL_Predict_Fallback, na.rm = TRUE),
+      Warning_Example = first_nonempty(Warning_Examples),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(Total_SL_gam_Warnings), desc(Total_SL_Warnings))
+  write.csv(learner_diag, analysis_file("learner_diagnostics.csv"), row.names = FALSE)
+  cat("Learner warnings:", sum(learner_diag$Total_Warnings, na.rm = TRUE),
+      "| SL.gam warnings:", sum(learner_diag$Total_SL_gam_Warnings, na.rm = TRUE),
+      "\n")
+} else {
+  message("Skipping learner diagnostics: worker output predates warning/fallback columns.")
+}
+
+if (all(c("Var_Y_SEM", "Var_Y_Eff", "Mean_Slope_Eff", "SD_Slope_Eff",
+          "Mean_Shift_Eff", "Mean_Mu_Shift", "SD_Mu_noY", "SD_Mu_Full",
+          "Draw_Scale") %in% names(df))) {
+  posterior_diag <- df %>%
+    group_by(n_size, meas_error, outcome, latent, indicators) %>%
+    summarise(
+      Reps = n(),
+      Mean_Var_Y_SEM = mean(Var_Y_SEM, na.rm = TRUE),
+      Mean_Var_Y_Eff = mean(Var_Y_Eff, na.rm = TRUE),
+      Mean_Slope_Eff = mean(Mean_Slope_Eff, na.rm = TRUE),
+      Mean_SD_Slope_Eff = mean(SD_Slope_Eff, na.rm = TRUE),
+      Mean_Shift_Eff = mean(Mean_Shift_Eff, na.rm = TRUE),
+      Mean_Mu_Shift = mean(Mean_Mu_Shift, na.rm = TRUE),
+      Mean_SD_Mu_noY = mean(SD_Mu_noY, na.rm = TRUE),
+      Mean_SD_Mu_Full = mean(SD_Mu_Full, na.rm = TRUE),
+      Mean_Draw_Scale = mean(Draw_Scale, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(n_size, outcome, latent, indicators, meas_error)
+  write.csv(posterior_diag, analysis_file("posterior_update_diagnostics.csv"),
+            row.names = FALSE)
+  cat("Wrote posterior update diagnostics.\n")
+} else {
+  message("Skipping posterior update diagnostics: worker output predates columns.")
+}
 
 # 3. PERFORMANCE METRICS (vs per-row True_Psi) ---------------------------------
 ok <- df %>% filter(is.na(Fail_Location) | Fail_Location == "None")
@@ -59,7 +125,7 @@ df_summary <- df_long %>%
     N_reps   = sum(!is.na(Estimate)),       # actual successful reps (not /1000)
     .groups  = "drop"
   )
-write.csv(df_summary, "final_results_summary.csv", row.names = FALSE)
+write.csv(df_summary, analysis_file("final_results_summary.csv"), row.names = FALSE)
 
 # 3b. LV-TMLE variance decomposition: how much SE comes from latent uncertainty?
 lv_var <- ok %>%
@@ -73,7 +139,7 @@ lv_var <- ok %>%
     latent_share_noY = mean_between_noY / (mean_within_noY + mean_between_noY),
     .groups = "drop"
   )
-write.csv(lv_var, "lv_variance_decomposition.csv", row.names = FALSE)
+write.csv(lv_var, analysis_file("lv_variance_decomposition.csv"), row.names = FALSE)
 # latent_share near 0 would mean the corrected SE still isn't propagating latent
 # uncertainty (a red flag); a healthy nonzero share is the whole point of Goal 1.
 
@@ -95,7 +161,7 @@ if (nrow(plot_slice) > 0) {
     geom_hline(yintercept = 0, linetype = "dashed") +
     theme_bw() + labs(title = "Absolute Bias (latent=normal, indicators=continuous)",
                       x = "Measurement error", y = "|Bias|")
-  ggsave("plot_abs_bias.png", p_bias, width = 10, height = 7)
+  ggsave(analysis_file("plot_abs_bias.png"), p_bias, width = 10, height = 7)
 
   p_rmse <- ggplot(plot_slice,
                    aes(meas_error, RMSE, color = Estimator, group = Estimator)) +
@@ -104,7 +170,7 @@ if (nrow(plot_slice) > 0) {
     scale_color_manual(values = est_cols) +
     theme_bw() + labs(title = "RMSE (latent=normal, indicators=continuous)",
                       x = "Measurement error", y = "RMSE")
-  ggsave("plot_rmse.png", p_rmse, width = 10, height = 7)
+  ggsave(analysis_file("plot_rmse.png"), p_rmse, width = 10, height = 7)
 
   p_cov <- ggplot(plot_slice,
                   aes(meas_error, Coverage, color = Estimator, group = Estimator)) +
@@ -115,7 +181,7 @@ if (nrow(plot_slice) > 0) {
     coord_cartesian(ylim = c(0, 1)) +
     theme_bw() + labs(title = "95% CI Coverage (latent=normal, indicators=continuous)",
                       x = "Measurement error", y = "Coverage")
-  ggsave("plot_coverage.png", p_cov, width = 10, height = 7)
+  ggsave(analysis_file("plot_coverage.png"), p_cov, width = 10, height = 7)
 } else {
   message("Skipping default plots: no latent=normal, indicators=continuous rows.")
 }
@@ -133,7 +199,7 @@ if (nrow(plot_latent) > 0) {
     coord_cartesian(ylim = c(0, 1)) +
     theme_bw() + labs(title = "Coverage by latent shape (outcome=nonlinear)",
                       x = "Measurement error", y = "Coverage")
-  ggsave("plot_coverage_by_latent.png", p_cov_latent, width = 10, height = 7)
+  ggsave(analysis_file("plot_coverage_by_latent.png"), p_cov_latent, width = 10, height = 7)
 } else {
   message("Skipping latent-shape coverage plot: no nonlinear continuous-indicator rows.")
 }

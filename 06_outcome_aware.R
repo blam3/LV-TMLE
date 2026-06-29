@@ -5,7 +5,8 @@
 # The v1 estimator in 01_setup.R imputes L from indicators only. That is useful as
 # an ablation, but it re-introduces attenuation because the imputation noise is
 # independent of Y. This file conditions latent draws on the analysis outcome:
-#   continuous indicators: closed-form Gaussian L | I, Y, W, Z
+#   continuous indicators: Gaussian L | I updated by a measurement-error-corrected
+#                          nonlinear outcome likelihood
 #   ordinal indicators   : regression-score approximation, then outcome update
 # ==============================================================================
 
@@ -74,6 +75,82 @@ fit_flexible_y_link <- function(dt, mu_noY, fallback_slope, fallback_var) {
   list(pred0 = pred0, slope = slope, var_eff = var_eff, pred_at = pred_at)
 }
 
+fit_me_corrected_y_link <- function(dt, mu_noY, post_sd_noY,
+                                    fallback_slope, fallback_var) {
+  post_var <- if (length(post_sd_noY) == 1) {
+    rep(post_sd_noY^2, nrow(dt))
+  } else {
+    post_sd_noY^2
+  }
+
+  dat <- data.frame(
+    Y = dt$Y,
+    L_m1 = mu_noY,
+    L_m2 = mu_noY^2 + post_var,
+    L_mW = mu_noY * dt$W,
+    W = dt$W,
+    Z = dt$Z,
+    Z_sq = dt$Z_sq
+  )
+
+  fit <- try(lm(Y ~ L_m1 + L_m2 + L_mW + W + Z + Z_sq, data = dat),
+             silent = TRUE)
+  if (inherits(fit, "try-error") || any(!is.finite(coef(fit)))) {
+    out <- fit_flexible_y_link(dt, mu_noY, fallback_slope, fallback_var)
+    out$link_type <- "flexible_fallback"
+    return(out)
+  }
+
+  cf <- coef(fit)
+  cf[is.na(cf)] <- 0
+  get_cf <- function(nm) if (nm %in% names(cf)) unname(cf[[nm]]) else 0
+  b0 <- get_cf("(Intercept)")
+  b1 <- get_cf("L_m1")
+  b2 <- get_cf("L_m2")
+  b3 <- get_cf("L_mW")
+  bW <- get_cf("W")
+  bZ <- get_cf("Z")
+  bZ2 <- get_cf("Z_sq")
+
+  pred_at <- function(a) {
+    b0 + b1 * a + b2 * a^2 + b3 * a * dt$W +
+      bW * dt$W + bZ * dt$Z + bZ2 * dt$Z_sq
+  }
+  pred0 <- pred_at(mu_noY)
+  pred_obs <- b0 + b1 * mu_noY + b2 * (mu_noY^2 + post_var) +
+    b3 * mu_noY * dt$W + bW * dt$W + bZ * dt$Z + bZ2 * dt$Z_sq
+  slope <- b1 + 2 * b2 * mu_noY + b3 * dt$W
+
+  raw_var <- mean((dt$Y - pred_obs)^2, na.rm = TRUE)
+  if (!is.finite(raw_var) || raw_var <= 0) raw_var <- fallback_var
+  if (!is.finite(raw_var) || raw_var <= 0) raw_var <- 1
+
+  c_lin <- b1 + b3 * dt$W
+  latent_var <- c_lin^2 * post_var +
+    4 * c_lin * b2 * mu_noY * post_var +
+    b2^2 * (2 * post_var^2 + 4 * mu_noY^2 * post_var)
+  latent_var <- pmax(latent_var, 0)
+
+  if (any(!is.finite(slope))) slope[!is.finite(slope)] <- fallback_slope
+  if (!is.finite(fallback_slope)) fallback_slope <- 0
+  slope[!is.finite(slope)] <- fallback_slope
+
+  qs <- quantile(slope, probs = c(0.01, 0.99), na.rm = TRUE, names = FALSE)
+  if (all(is.finite(qs)) && qs[1] < qs[2]) {
+    slope <- pmin(pmax(slope, qs[1]), qs[2])
+  }
+  slope <- pmin(pmax(slope, -12), 12)
+
+  list(
+    pred0 = pred0,
+    slope = slope,
+    var_eff = raw_var,
+    pred_at = pred_at,
+    latent_resid_var = mean(latent_var, na.rm = TRUE),
+    link_type = "me_quadratic"
+  )
+}
+
 flexible_posterior_moments <- function(dt, mu_noY, post_sd_noY, y_link,
                                        grid_width = 5, grid_n = 81) {
   n <- nrow(dt)
@@ -112,10 +189,10 @@ sem_posterior_full <- function(dt, indicators_type) {
     Y ~ L + W + Z + Z_sq
   '
 
-  fit <- try(suppressWarnings(
+  fit <- try(with_lavaan_core_fallback(suppressWarnings(
     sem(sem_model, data = as.data.frame(dt), ordered = ordered_vars,
-        std.lv = FALSE, auto.fix.first = TRUE)
-  ), silent = TRUE)
+        std.lv = FALSE, auto.fix.first = TRUE, ncpus = 1L)
+  )), silent = TRUE)
 
   if (inherits(fit, "try-error") || !lavInspect(fit, "converged"))
     return(list(converged = FALSE, reason = "SEM_no_converge"))
@@ -162,13 +239,19 @@ sem_posterior_full <- function(dt, indicators_type) {
     post_sd_noY <- 0.5 * sd(mu_noY, na.rm = TRUE)
   if (!is.finite(post_sd_noY) || post_sd_noY <= 0) post_sd_noY <- 0.5
 
-  y_link <- fit_flexible_y_link(dt, mu_noY, fallback_slope = b_y_l,
-                                fallback_var = var_y)
+  y_link <- fit_me_corrected_y_link(dt, mu_noY, post_sd_noY,
+                                    fallback_slope = b_y_l,
+                                    fallback_var = var_y)
   post_var_noY <- post_sd_noY^2
   slope <- y_link$slope
   pred0 <- y_link$pred0
   raw_var_y_eff <- y_link$var_eff
-  latent_resid_var <- mean(slope^2, na.rm = TRUE) * post_var_noY
+  latent_resid_var <- if (!is.null(y_link$latent_resid_var) &&
+                          is.finite(y_link$latent_resid_var)) {
+    y_link$latent_resid_var
+  } else {
+    mean(slope^2, na.rm = TRUE) * post_var_noY
+  }
   var_y_eff <- raw_var_y_eff - latent_resid_var
   if (exists("Y_SD")) var_y_eff <- max(var_y_eff, Y_SD^2)
   if (!is.finite(var_y_eff) || var_y_eff <= 0) var_y_eff <- raw_var_y_eff
@@ -204,7 +287,7 @@ sem_posterior_full <- function(dt, indicators_type) {
     post_sd_full = as.numeric(post_sd_full),
     diagnostics = list(
       var_y_sem = as.numeric(var_y),
-      var_y_flex_raw = as.numeric(raw_var_y_eff),
+      var_y_link_raw = as.numeric(raw_var_y_eff),
       var_y_latent_correction = as.numeric(latent_resid_var),
       var_y_eff = as.numeric(var_y_eff),
       mean_slope_eff = mean(slope, na.rm = TRUE),
@@ -233,10 +316,7 @@ run_comparison_v2 <- function(dt, indicators_type, M = 25, V = 5, delta = 1,
                        sd_mu_noY = NA, sd_mu_full = NA, draw_scale = NA)
   )
 
-  sl_lib <- if (nrow(dt) <= 100)
-    c("SL.glm", "SL.mean", "SL.rpart", "SL.earth")
-  else
-    c("SL.glm", "SL.earth", "SL.gam", "SL.mean", "SL.rpart")
+  sl_lib <- lv_sl_library(nrow(dt))
 
   post <- sem_posterior_full(dt, indicators_type)
   if (!isTRUE(post$converged)) return(na_out(post$reason))

@@ -19,7 +19,7 @@
 #
 # RUNTIME: noticeably heavier than 05 -- include_noY adds a SECOND block of M
 #          shift-TMLE fits per rep (the ablation). For a fast sanity pass set
-#          REPS <- 15 and M <- 10 below.
+#          options(lv_tmle.reps = 15, lv_tmle.M = 10) before sourcing.
 #
 # ENVIRONMENT: R with lavaan, data.table, SuperLearner, earth, rpart, gam, dplyr,
 #              and 00_dgp_variants.R / 01_setup.R / 06_outcome_aware.R in the wd.
@@ -38,9 +38,27 @@ F_DIAG <- c("var_y_sem", "var_y_eff", "mean_slope_eff", "sd_slope_eff",
 # ------------------------------------------------------------------------------
 
 # ---- Config (mirror 05_smoke_test.R so the cells are comparable) -------------
-REPS <- as.integer(getOption("lv_tmle.reps", Sys.getenv("LVTMLE_REPS", "40")))
-M    <- as.integer(getOption("lv_tmle.M",    Sys.getenv("LVTMLE_M",    "20")))
-V    <- as.integer(getOption("lv_tmle.V",    Sys.getenv("LVTMLE_V",    "5")))
+read_int_knob <- function(option_name, env_name, default) {
+  val <- getOption(option_name, NULL)
+  if (is.null(val) || length(val) == 0 || !nzchar(as.character(val)[1])) {
+    val <- Sys.getenv(env_name, unset = as.character(default))
+  }
+  out <- suppressWarnings(as.integer(val[1]))
+  if (!is.finite(out) || out <= 0) default else out
+}
+read_num_knob <- function(option_name, env_name, default) {
+  val <- getOption(option_name, NULL)
+  if (is.null(val) || length(val) == 0 || !nzchar(as.character(val)[1])) {
+    val <- Sys.getenv(env_name, unset = as.character(default))
+  }
+  out <- suppressWarnings(as.numeric(val[1]))
+  if (!is.finite(out) || out <= 0) default else out
+}
+
+REPS <- read_int_knob("lv_tmle.reps", "LVTMLE_REPS", 40)
+M    <- read_int_knob("lv_tmle.M",    "LVTMLE_M",    20)
+V    <- read_int_knob("lv_tmle.V",    "LVTMLE_V",    5)
+DRAW_SCALE <- read_num_knob("lv_tmle.draw_scale", "LVTMLE_DRAW_SCALE", 0.5)
 SEED <- 12345
 
 SCEN_OUTCOME    <- "nonlinear"
@@ -58,6 +76,8 @@ source("01_setup.R")
 source("06_outcome_aware.R")   # run_comparison_v2(), sem_posterior_full()
 
 set.seed(SEED)
+cat(sprintf("\nConfig: REPS=%d  M=%d  V=%d  draw_scale=%.2f  seed=%d\n",
+            REPS, M, V, DRAW_SCALE, SEED))
 
 # ---- True psi for this cell: cache AND an independent recompute ---------------
 row <- subset(sim_grid,
@@ -77,7 +97,8 @@ set.seed(SEED)
 
 # ---- Replication loop --------------------------------------------------------
 cols <- c("SEM", "RegCal", "LV", "Oracle", "LV_noY")
-est <- se <- matrix(NA_real_, REPS, length(cols), dimnames = list(NULL, cols))
+est <- matrix(NA_real_, REPS, length(cols), dimnames = list(NULL, cols))
+se_mat <- matrix(NA_real_, REPS, length(cols), dimnames = list(NULL, cols))
 lvB <- lvW <- rep(NA_real_, REPS)
 diag_mat <- matrix(NA_real_, REPS, length(F_DIAG), dimnames = list(NULL, F_DIAG))
 rep_errors <- rep(NA_character_, REPS)
@@ -97,7 +118,8 @@ for (b in 1:REPS) {
 
   r <- tryCatch(
     run_comparison_v2(dt, indicators_type = SCEN_INDICATORS,
-                      M = M, V = V, include_noY = TRUE),
+                      M = M, V = V, include_noY = TRUE,
+                      draw_scale = DRAW_SCALE),
     error = function(e) {
       rep_errors[b] <<- conditionMessage(e)
       NULL
@@ -106,8 +128,8 @@ for (b in 1:REPS) {
   if (!is.null(r)) {
     for (j in cols) {
       est[b, j] <- get_field(r, F_EST[[j]])
-      se[b, j]  <- get_field(r, F_SE[[j]])
-      covm[b, j] <- cov_flag(est[b, j], se[b, j])
+      se_mat[b, j]  <- get_field(r, F_SE[[j]])
+      covm[b, j] <- cov_flag(est[b, j], se_mat[b, j])
     }
     lvB[b] <- get_field(r$diagnostics, F_B)
     lvW[b] <- get_field(r$diagnostics, F_WBAR)
@@ -119,14 +141,14 @@ for (b in 1:REPS) {
     cat(sprintf("  rep %d/%d  (elapsed %.1f min)\n", b, REPS,
                 as.numeric(difftime(Sys.time(), t0, units = "mins"))))
 }
-saveRDS(list(est = est, se = se, lvB = lvB, lvW = lvW,
+saveRDS(list(est = est, se = se_mat, lvB = lvB, lvW = lvW,
              posterior_diagnostics = diag_mat, errors = rep_errors,
              fail_location = fail_location, fail_reason = fail_reason, PSI = PSI),
         "smoke_test_oaware_raw.rds")
 
 # ---- Summary table -----------------------------------------------------------
 summ <- function(j) {
-  e <- est[, j]; s <- se[, j]; ok <- is.finite(e)
+  e <- est[, j]; s <- se_mat[, j]; ok <- is.finite(e)
   n <- sum(ok)
   emp_sd <- sd(e[ok])
   if (n == 0) {
@@ -161,7 +183,7 @@ cat(sprintf("\nLV-TMLE (outcome-aware) variance decomposition:  within (W_bar)=%
             mW, mB, 100 * share))
 
 diag_avg <- colMeans(diag_mat, na.rm = TRUE)
-cat(sprintf("\nOutcome-aware posterior diagnostics: SEM var_y=%.3f  flexible var_y=%.3f  mean dY/dL=%.3f  mean shift=%.3f  sd(mu_noY)=%.3f  sd(mu_full)=%.3f  draw_scale=%.2f\n",
+cat(sprintf("\nOutcome-aware posterior diagnostics: SEM var_y=%.3f  outcome-link var_y=%.3f  mean dY/dL=%.3f  mean shift=%.3f  sd(mu_noY)=%.3f  sd(mu_full)=%.3f  draw_scale=%.2f\n",
             diag_avg["var_y_sem"], diag_avg["var_y_eff"],
             diag_avg["mean_slope_eff"], diag_avg["mean_shift_eff"],
             diag_avg["sd_mu_noY"],
@@ -186,7 +208,7 @@ add("Oracle recovers psi (engine OK)", abs(get("Oracle", "Bias")) < oracle_tol,
 add("B > 0 and propagates (Rubin SE OK)", is.finite(mB) && mB > 0 && share > 0.01,
     sprintf("B = %.4g, latent share = %.1f%%", mB, 100 * share))
 
-add("Y update uses flexible residual variance", is.finite(diag_avg["var_y_eff"]) &&
+add("Y update uses reduced residual variance", is.finite(diag_avg["var_y_eff"]) &&
       is.finite(diag_avg["var_y_sem"]) && diag_avg["var_y_eff"] < diag_avg["var_y_sem"],
     sprintf("var_y_eff = %.3f vs SEM var_y = %.3f",
             diag_avg["var_y_eff"], diag_avg["var_y_sem"]))
@@ -235,7 +257,11 @@ if (any(!is.na(rep_errors))) {
 }
 if (any(!is.na(fail_reason) & fail_reason != "None")) {
   cat("\n--- Structured fit failures ---\n")
-  print(sort(table(fail_location, fail_reason), decreasing = TRUE))
+  fail_tab <- as.data.frame(table(fail_location, fail_reason),
+                            responseName = "n")
+  fail_tab <- fail_tab[fail_tab$n > 0, , drop = FALSE]
+  fail_tab <- fail_tab[order(fail_tab$n, decreasing = TRUE), , drop = FALSE]
+  print(fail_tab, row.names = FALSE)
 }
 
 infra_pass <- all(vapply(checks, function(c) isTRUE(c$pass), logical(1)))

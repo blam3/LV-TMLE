@@ -71,7 +71,7 @@ regcal_estimate <- function(dt, sl_lib, V = 5, delta = 1) {
   d <- copy(dt); d[, Z_sq := Z^2]
   fit <- try(suppressWarnings(
     sem(cfa_model_str, data = as.data.frame(d),
-        std.lv = FALSE, auto.fix.first = TRUE)), silent = TRUE)
+        std.lv = FALSE, auto.fix.first = TRUE, ncpus = 1L)), silent = TRUE)
   if (inherits(fit, "try-error") || !lavInspect(fit, "converged"))
     return(list(psi = NA_real_, se = NA_real_))
   mu_reg <- try(lavPredict(fit, method = "regression")[, "L"], silent = TRUE)
@@ -82,10 +82,7 @@ regcal_estimate <- function(dt, sl_lib, V = 5, delta = 1) {
 }
 
 # Match run_comparison's learner library for this n.
-if (SCEN_N <= 100) {
-  sl_lib <- c("SL.glm", "SL.mean", "SL.rpart", "SL.earth")
-} else { sl_lib <- c("SL.glm", "SL.earth", "SL.gam", "SL.mean", "SL.rpart")
-  }
+sl_lib <- lv_sl_library(SCEN_N)
 
 # ---- Replication loop -------------------------------------------------------
 cols <- c("Naive", "SEM", "Robust", "Oracle", "RegCal")
@@ -190,4 +187,3 @@ cat(sprintf("\n==> INFRASTRUCTURE: %s\n", if (infra_pass) "OK -- engine, Rubin S
                                           else "PROBLEM -- fix before scaling up."))
 cat("==> METHOD: the point-estimate fix (regression scores + outcome-aware draws)\n",
     "    still needs to be settled before the full array. See notes.\n")
-

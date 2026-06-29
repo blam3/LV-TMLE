@@ -6,6 +6,7 @@
 1. To integrate latent variables from the structural equation modeling tradition with targeted maximum likelihood estimation (LV-TMLE).
 2. To successfully conduct a simulation study that compares LV-TMLE with suitable alternatives.
 3. To demonstrate that LV-TMLE is a viable alternative in realistic conditions for psychologists to use. For LV-TMLE to be viable, it should be better than the alternatives we compare it to in our simulation. This means that it should perform better in most conditions but LV-TMLE does not have to perform better in all conditions.
+4. To write up the project into a manuscript that I can submit to the journal, "Multivariate Behavioral Research".
 
 ### Constraints
 - Manuscript writing should be in a style and format that is suitable to publish in the journal, "Multivariate Behavioral Research".
